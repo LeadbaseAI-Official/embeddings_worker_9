@@ -6,6 +6,7 @@ on:
       - 'pipline.py'
       - 'comat.cpp'
       - '.github/workflows/main.yml'
+  workflow_dispatch:
 
 jobs:
   build-and-stream:
