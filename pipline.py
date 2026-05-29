@@ -130,7 +130,7 @@ def run_pipeline() -> None:
                 table = pq.read_table(local_parquet, columns=["token_ids"])
                 
                 # Flatten the Arrow list structure natively to keep RAM under 200MB (prevents OOM crashes)
-                flat_tokens = pc.cast(table["token_ids"].flatten(), pa.uint16())
+                flat_tokens = pc.cast(pc.list_flatten(table["token_ids"]), pa.uint16())
                 tokens_np = flat_tokens.to_numpy(zero_copy_only=False)
                 
                 # Append raw uint16 bytes directly to combined file
