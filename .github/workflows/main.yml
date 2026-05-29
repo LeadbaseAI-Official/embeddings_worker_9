@@ -1,0 +1,40 @@
+name: Build Semantic Neighbors
+
+on:
+  push:
+    paths:
+      - 'pipline.py'
+      - 'comat.cpp'
+      - '.github/workflows/main.yml'
+
+jobs:
+  build-and-stream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Compile comat.cpp
+        run: g++ -O3 -march=native -o comat comat.cpp
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install datasets huggingface_hub numpy scipy
+
+      - name: Run Pipeline
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python pipline.py
+
+      - name: Upload counts .npz as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: counts-worker
+          path: counts_*.npz
+          retention-days: 10
