@@ -2,6 +2,8 @@ import os
 import sys
 import subprocess
 from typing import List
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import numpy as np
 from huggingface_hub import HfApi, hf_hub_download
@@ -126,10 +128,10 @@ def run_pipeline() -> None:
                 
                 # Load parquet table and extract token_ids column
                 table = pq.read_table(local_parquet, columns=["token_ids"])
-                token_ids_list = table["token_ids"].to_pylist()
                 
-                # Flatten the list of lists into a 1D NumPy array
-                tokens_np = np.concatenate([np.array(doc, dtype=np.uint16) for doc in token_ids_list])
+                # Flatten the Arrow list structure natively to keep RAM under 200MB (prevents OOM crashes)
+                flat_tokens = pc.cast(table["token_ids"].flatten(), pa.uint16())
+                tokens_np = flat_tokens.to_numpy(zero_copy_only=False)
                 
                 # Append raw uint16 bytes directly to combined file
                 f_out.write(tokens_np.tobytes())
