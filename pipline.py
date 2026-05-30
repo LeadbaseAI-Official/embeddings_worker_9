@@ -114,11 +114,11 @@ def run_pipeline() -> None:
     # 2. Fetch input shards list
     all_shards = get_input_shards_list(api)
     
-    # Filter for shards that have not been processed yet
+    # Filter for shards that have not been processed yet (strictly limited to s0-s3)
     shards_to_process: List[str] = []
     for path in all_shards:
         idx = extract_shard_index(path)
-        if idx > last_completed_idx:
+        if idx > last_completed_idx and idx <= 3:
             shards_to_process.append(path)
 
     if not shards_to_process:
