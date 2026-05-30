@@ -33,9 +33,10 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python pipline.py
 
-      - name: Upload counts .npz as Artifact
+      - name: Upload counts .bin as Artifact
         uses: actions/upload-artifact@v4
         with:
           name: counts-worker
-          path: counts_*.npz
+          path: counts_*.bin
+          if-no-files-found: ignore
           retention-days: 10
