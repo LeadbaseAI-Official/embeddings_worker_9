@@ -163,9 +163,127 @@ void merge_chunks(const vector<string>& temp_files, const char* outfile_path) {
     cerr << "Saved " << written << " unique pairs to " << outfile_path << endl;
 }
 
+// 2-way stream merge of two sorted co-occurrence binary files
+void stream_merge(const char* f1_path, const char* f2_path, const char* out_path) {
+    cerr << "Merging " << f1_path << " and " << f2_path << " into " << out_path << "..." << endl;
+    FILE* f1 = fopen(f1_path, "rb");
+    FILE* f2 = fopen(f2_path, "rb");
+    FILE* out = fopen(out_path, "wb");
+
+    if (!out) {
+        cerr << "ERROR: cannot open output file " << out_path << endl;
+        if (f1) fclose(f1);
+        if (f2) fclose(f2);
+        exit(1);
+    }
+
+    if (!f1 && !f2) {
+        fclose(out);
+        return;
+    }
+
+    if (!f1) {
+        // Copy f2 to out
+        uint8_t buffer[65536];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), f2)) > 0) {
+            fwrite(buffer, 1, bytes, out);
+        }
+        fclose(f2);
+        fclose(out);
+        return;
+    }
+
+    if (!f2) {
+        // Copy f1 to out
+        uint8_t buffer[65536];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), f1)) > 0) {
+            fwrite(buffer, 1, bytes, out);
+        }
+        fclose(f1);
+        fclose(out);
+        return;
+    }
+
+    struct Record {
+        uint16_t i;
+        uint16_t j;
+        uint32_t count;
+        uint32_t key() const {
+            return ((uint32_t)i << 16) | j;
+        }
+    };
+
+    Record r1, r2;
+    bool has_r1 = fread(&r1.i, 2, 1, f1) && fread(&r1.j, 2, 1, f1) && fread(&r1.count, 4, 1, f1);
+    bool has_r2 = fread(&r2.i, 2, 1, f2) && fread(&r2.j, 2, 1, f2) && fread(&r2.count, 4, 1, f2);
+
+    uint64_t written = 0;
+
+    while (has_r1 && has_r2) {
+        uint32_t k1 = r1.key();
+        uint32_t k2 = r2.key();
+
+        if (k1 < k2) {
+            fwrite(&r1.i, 2, 1, out);
+            fwrite(&r1.j, 2, 1, out);
+            fwrite(&r1.count, 4, 1, out);
+            written++;
+            has_r1 = fread(&r1.i, 2, 1, f1) && fread(&r1.j, 2, 1, f1) && fread(&r1.count, 4, 1, f1);
+        } else if (k2 < k1) {
+            fwrite(&r2.i, 2, 1, out);
+            fwrite(&r2.j, 2, 1, out);
+            fwrite(&r2.count, 4, 1, out);
+            written++;
+            has_r2 = fread(&r2.i, 2, 1, f2) && fread(&r2.j, 2, 1, f2) && fread(&r2.count, 4, 1, f2);
+        } else {
+            // equal keys, merge counts
+            uint64_t merged_count = (uint64_t)r1.count + r2.count;
+            uint32_t c = (merged_count > 0xFFFFFFFF) ? 0xFFFFFFFF : (uint32_t)merged_count;
+            fwrite(&r1.i, 2, 1, out);
+            fwrite(&r1.j, 2, 1, out);
+            fwrite(&c, 4, 1, out);
+            written++;
+            has_r1 = fread(&r1.i, 2, 1, f1) && fread(&r1.j, 2, 1, f1) && fread(&r1.count, 4, 1, f1);
+            has_r2 = fread(&r2.i, 2, 1, f2) && fread(&r2.j, 2, 1, f2) && fread(&r2.count, 4, 1, f2);
+        }
+    }
+
+    while (has_r1) {
+        fwrite(&r1.i, 2, 1, out);
+        fwrite(&r1.j, 2, 1, out);
+        fwrite(&r1.count, 4, 1, out);
+        written++;
+        has_r1 = fread(&r1.i, 2, 1, f1) && fread(&r1.j, 2, 1, f1) && fread(&r1.count, 4, 1, f1);
+    }
+
+    while (has_r2) {
+        fwrite(&r2.i, 2, 1, out);
+        fwrite(&r2.j, 2, 1, out);
+        fwrite(&r2.count, 4, 1, out);
+        written++;
+        has_r2 = fread(&r2.i, 2, 1, f2) && fread(&r2.j, 2, 1, f2) && fread(&r2.count, 4, 1, f2);
+    }
+
+    fclose(f1);
+    fclose(f2);
+    fclose(out);
+    cerr << "Merge completed. Saved " << written << " unique pairs to " << out_path << endl;
+}
+
 int main(int argc, char* argv[]) {
+    if (argc >= 5 && string(argv[1]) == "--merge") {
+        const char* f1_path = argv[2];
+        const char* f2_path = argv[3];
+        const char* out_path = argv[4];
+        stream_merge(f1_path, f2_path, out_path);
+        return 0;
+    }
+
     if (argc < 3) {
         cerr << "Usage: " << argv[0] << " <input_tokens.bin> <output_counts.bin> [window_size]" << endl;
+        cerr << "   or: " << argv[0] << " --merge <file1.bin> <file2.bin> <output.bin>" << endl;
         return 1;
     }
 
