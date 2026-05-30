@@ -16,7 +16,7 @@
 using namespace std;
 
 int WINDOW = 5; // Default window size
-const size_t MEMORY_LIMIT_PAIRS = 15000000; // Dump to disk when we reach 15M unique pairs (~180MB RAM)
+const size_t MEMORY_LIMIT_PAIRS = 600000000; // Dump to disk when we reach 600M unique pairs (~7.7GB map + ~4.8GB temp sort vector)
 
 inline uint32_t pack(uint16_t a, uint16_t b) {
     if (a > b) swap(a, b);
