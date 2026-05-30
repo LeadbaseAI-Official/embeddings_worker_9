@@ -2,6 +2,9 @@ import os
 import sys
 import subprocess
 from typing import List
+import json
+import urllib.request
+import time
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -18,39 +21,88 @@ HF_OUTPUT_REPO = "anisoleai/embeddings"
 HF_TOKEN = os.getenv("HF_TOKEN")
 WINDOW_SIZE = 5
 MAX_SHARDS_PER_RUN = 2
+GITHUB_ORG = "LeadbaseAI-Official"
 
 TEMP_TOKENS_BIN = "combined_tokens.bin"
 TEMP_COUNTS_BIN = "counts_temp.bin"
 
 def get_last_processed_shard_index(api: HfApi) -> int:
     """
-    Scan the output repository to find files matching 'counts_{WORKER_ID}_s{SHARD_INDEX}.bin'.
-    Extract and return the maximum SHARD_INDEX found.
+    Download and parse metadata.json from HF output repository for worker progress.
     """
-    print(f"Scanning output repository {HF_OUTPUT_REPO} for worker {WORKER_ID} progress...", flush=True)
+    metadata_path = f"data_{WORKER_ID}/metadata.json"
+    print(f"Downloading metadata file {metadata_path} from HF...", flush=True)
     try:
-        all_files: List[str] = api.list_repo_files(repo_id=HF_OUTPUT_REPO, repo_type="dataset", token=HF_TOKEN)
+        local_path = hf_hub_download(
+            repo_id=HF_OUTPUT_REPO,
+            filename=metadata_path,
+            repo_type="dataset",
+            token=HF_TOKEN
+        )
+        with open(local_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            last_idx = data.get("last_processed_shard_index", -1)
+            print(f"Highest processed shard index from metadata: {last_idx}", flush=True)
+            return last_idx
     except Exception as e:
-        print(f"Error listing output repo files: {e}. Assuming fresh start.", flush=True)
+        print(f"Error downloading/reading metadata file: {e}. Assuming fresh start (-1).", flush=True)
         return -1
 
-    prefix = f"counts_{WORKER_ID}_s"
-    suffix = ".bin"
-    last_idx = -1
-    
-    for filename in all_files:
-        if filename.startswith(prefix) and filename.endswith(suffix):
-            try:
-                # Extract index from counts_W_s{INDEX}.bin
-                idx_str = filename[len(prefix): -len(suffix)]
-                idx = int(idx_str)
-                if idx > last_idx:
-                    last_idx = idx
-            except ValueError:
-                continue
+def save_metadata(api: HfApi, last_idx: int) -> None:
+    """
+    Write and upload updated metadata.json to HF output repository.
+    """
+    metadata_path = f"data_{WORKER_ID}/metadata.json"
+    local_path = "metadata.json"
+    try:
+        data = {"last_processed_shard_index": last_idx}
+        with open(local_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            
+        print(f"Uploading updated metadata to {metadata_path} (index: {last_idx})...", flush=True)
+        api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=metadata_path,
+            repo_id=HF_OUTPUT_REPO,
+            repo_type="dataset",
+            token=HF_TOKEN
+        )
+    except Exception as e:
+        print(f"Error saving/uploading metadata: {e}", flush=True)
+    finally:
+        if os.path.exists(local_path):
+            os.remove(local_path)
 
-    print(f"Highest processed shard index found: {last_idx}", flush=True)
-    return last_idx
+def trigger_next_run() -> None:
+    """
+    Trigger workflow dispatch for the current worker's GitHub repository.
+    """
+    github_pat = os.getenv("GITHUB_PAT")
+    if not github_pat:
+        print("Warning: GITHUB_PAT env variable is not set. Cannot chain trigger next run.", flush=True)
+        return
+
+    repo_name = f"embeddings_worker_{WORKER_ID}"
+    url = f"https://api.github.com/repos/{GITHUB_ORG}/{repo_name}/actions/workflows/main.yml/dispatches"
+    data = json.dumps({"ref": "main"}).encode("utf-8")
+    
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"token {github_pat}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "embeddings-chain-trigger",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    print(f"Triggering next execution for repository {GITHUB_ORG}/{repo_name}...", flush=True)
+    try:
+        with urllib.request.urlopen(req) as response:
+            print("Successfully triggered next run via workflow_dispatch.", flush=True)
+    except Exception as e:
+        print(f"Error triggering next run: {e}", flush=True)
 
 def get_input_shards_list(api: HfApi) -> List[str]:
     """
@@ -83,11 +135,9 @@ def run_pipeline() -> None:
         print("ERROR: HF_TOKEN is not set in environment.", file=sys.stderr, flush=True)
         sys.exit(1)
 
-    import shutil
-
     api = HfApi()
 
-    # 1. Fetch the last completed shard index from output file naming
+    # 1. Fetch progress from metadata.json
     last_completed_idx = get_last_processed_shard_index(api)
 
     # 2. Fetch input shards list
@@ -114,33 +164,19 @@ def run_pipeline() -> None:
         subprocess.run(cmd, check=True)
         print("Compilation successful.", flush=True)
 
-    accumulated_file = "accumulated_counts.bin"
-    if os.path.exists(accumulated_file):
-        os.remove(accumulated_file)
-
-    # If we resumed from a previously completed index, download the latest counts file
-    if last_completed_idx >= 0:
-        prev_filename = f"counts_{WORKER_ID}_s{last_completed_idx}.bin"
-        print(f"Downloading previous counts file {prev_filename} to resume...", flush=True)
-        try:
-            downloaded = hf_hub_download(
-                repo_id=HF_OUTPUT_REPO,
-                filename=prev_filename,
-                repo_type="dataset",
-                token=HF_TOKEN
-            )
-            shutil.copy(downloaded, accumulated_file)
-            print(f"Resumed successfully from shard index {last_completed_idx}.", flush=True)
-        except Exception as e:
-            print(f"Warning: Could not download previous progress file: {e}. Starting fresh.", flush=True)
-            last_completed_idx = -1
-
+    # Capped at 10 shards per runner run (to prevent timeout)
+    SHARDS_LIMIT_THIS_RUN = 10
     batch_size = MAX_SHARDS_PER_RUN
+    
+    # We only process up to SHARDS_LIMIT_THIS_RUN
+    run_shards = shards_to_process[:SHARDS_LIMIT_THIS_RUN]
+    print(f"Worker {WORKER_ID} will process {len(run_shards)} shards in this execution.", flush=True)
+
     current_idx = 0
     max_completed_idx = last_completed_idx
 
-    while current_idx < len(shards_to_process):
-        batch = shards_to_process[current_idx : current_idx + batch_size]
+    while current_idx < len(run_shards):
+        batch = run_shards[current_idx : current_idx + batch_size]
         current_idx += batch_size
 
         print(f"\n--- Processing batch: {batch} ---", flush=True)
@@ -150,6 +186,9 @@ def run_pipeline() -> None:
 
         downloaded_parquet_files = []
         try:
+            batch_start_idx = extract_shard_index(batch[0])
+            batch_end_idx = extract_shard_index(batch[-1])
+
             with open(TEMP_TOKENS_BIN, "wb") as f_out:
                 for shard_path in batch:
                     idx = extract_shard_index(shard_path)
@@ -175,17 +214,21 @@ def run_pipeline() -> None:
             subprocess.run([binary_name, TEMP_TOKENS_BIN, TEMP_COUNTS_BIN, str(WINDOW_SIZE)], check=True)
             print("C++ counting completed successfully.", flush=True)
 
-            # Merge iteration counts into accumulated counts
-            new_accumulated = "accumulated_counts_new.bin"
-            if os.path.exists(new_accumulated):
-                os.remove(new_accumulated)
+            # Upload counts binary file directly to HF (no local merging!)
+            timestamp = int(time.time())
+            dest_filename = f"data_{WORKER_ID}/counts_s{batch_start_idx}_s{batch_end_idx}_{timestamp}.bin"
+            print(f"Uploading batch output file {TEMP_COUNTS_BIN} as {dest_filename}...", flush=True)
+            api.upload_file(
+                path_or_fileobj=TEMP_COUNTS_BIN,
+                path_in_repo=dest_filename,
+                repo_id=HF_OUTPUT_REPO,
+                repo_type="dataset",
+                token=HF_TOKEN
+            )
+            print(f"Upload successful. Completed batch shards: s{batch_start_idx} to s{batch_end_idx}", flush=True)
 
-            print(f"Merging iteration counts into accumulated counts...", flush=True)
-            subprocess.run([binary_name, "--merge", accumulated_file, TEMP_COUNTS_BIN, new_accumulated], check=True)
-
-            if os.path.exists(accumulated_file):
-                os.remove(accumulated_file)
-            os.rename(new_accumulated, accumulated_file)
+            # Save progress in metadata
+            save_metadata(api, max_completed_idx)
 
         finally:
             # Cleanup temporary files
@@ -200,21 +243,14 @@ def run_pipeline() -> None:
                     except Exception as e:
                         print(f"Warning: Failed to delete local parquet file {pq_file}: {e}", flush=True)
 
-    # 3. Upload the final co-occurrence binary file at the very end
-    if os.path.exists(accumulated_file):
-        dest_filename = f"counts_{WORKER_ID}_s{max_completed_idx}.bin"
-        print(f"Uploading final output file {accumulated_file} as {dest_filename}...", flush=True)
-        api.upload_file(
-            path_or_fileobj=accumulated_file,
-            path_in_repo=dest_filename,
-            repo_id=HF_OUTPUT_REPO,
-            repo_type="dataset",
-            token=HF_TOKEN
-        )
-        print(f"Upload successful. Completed up to shard index: {max_completed_idx}", flush=True)
-        os.remove(accumulated_file)
+    # 5. Chain triggering: If there are still shards left, dispatch the next runner run
+    remaining_shards = shards_to_process[len(run_shards):]
+    if remaining_shards:
+        print(f"Workflow completed processing {len(run_shards)} shards.", flush=True)
+        print(f"{len(remaining_shards)} shards remaining in total queue.", flush=True)
+        trigger_next_run()
     else:
-        print("Error: accumulated counts file not found at the end of the run.", file=sys.stderr, flush=True)
+        print("All remaining shards have been successfully processed!", flush=True)
 
 if __name__ == "__main__":
     run_pipeline()
