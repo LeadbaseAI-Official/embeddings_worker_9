@@ -31,7 +31,7 @@ jobs:
       - name: Run Pipeline
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GITHUB_PAT: ${{ secrets.GH_PAT }}
         run: python pipline.py
 
       - name: Upload counts .bin as Artifact
