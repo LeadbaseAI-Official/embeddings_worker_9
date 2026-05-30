@@ -17,6 +17,7 @@ HF_INPUT_REPO = "anisoleai/fineweb-tokenized"
 HF_OUTPUT_REPO = "anisoleai/embeddings"
 HF_TOKEN = os.getenv("HF_TOKEN")
 WINDOW_SIZE = 5
+MAX_SHARDS_PER_RUN = 2
 
 TEMP_TOKENS_BIN = "combined_tokens.bin"
 TEMP_COUNTS_BIN = "counts_temp.bin"
@@ -82,6 +83,8 @@ def run_pipeline() -> None:
         print("ERROR: HF_TOKEN is not set in environment.", file=sys.stderr, flush=True)
         sys.exit(1)
 
+    import shutil
+
     api = HfApi()
 
     # 1. Fetch the last completed shard index from output file naming
@@ -101,80 +104,117 @@ def run_pipeline() -> None:
         print(f"All shards for Worker {WORKER_ID} are already processed! Exiting.", flush=True)
         return
 
-    # Cap to max 60 shards per run to comfortably process within Actions runtime limits
-    max_shards_per_run = 60
-    shards_to_process = shards_to_process[:max_shards_per_run]
-    print(f"Worker {WORKER_ID} will process {len(shards_to_process)} shards in this run.", flush=True)
+    print(f"Worker {WORKER_ID} has {len(shards_to_process)} shards remaining to process.", flush=True)
 
-    # 3. Concatenate all shard tokens into a single binary file
-    if os.path.exists(TEMP_TOKENS_BIN):
-        os.remove(TEMP_TOKENS_BIN)
+    # Compile comat.cpp if binary is missing
+    binary_name = "./comat" if not sys.platform.startswith("win") else "comat.exe"
+    if not os.path.exists(binary_name):
+        print(f"Compiling comat.cpp...", flush=True)
+        cmd = ["g++", "-O3", "-march=native", "-o", binary_name, "comat.cpp"]
+        subprocess.run(cmd, check=True)
+        print("Compilation successful.", flush=True)
 
+    accumulated_file = "accumulated_counts.bin"
+    if os.path.exists(accumulated_file):
+        os.remove(accumulated_file)
+
+    # If we resumed from a previously completed index, download the latest counts file
+    if last_completed_idx >= 0:
+        prev_filename = f"counts_{WORKER_ID}_s{last_completed_idx}.bin"
+        print(f"Downloading previous counts file {prev_filename} to resume...", flush=True)
+        try:
+            downloaded = hf_hub_download(
+                repo_id=HF_OUTPUT_REPO,
+                filename=prev_filename,
+                repo_type="dataset",
+                token=HF_TOKEN
+            )
+            shutil.copy(downloaded, accumulated_file)
+            print(f"Resumed successfully from shard index {last_completed_idx}.", flush=True)
+        except Exception as e:
+            print(f"Warning: Could not download previous progress file: {e}. Starting fresh.", flush=True)
+            last_completed_idx = -1
+
+    batch_size = MAX_SHARDS_PER_RUN
+    current_idx = 0
     max_completed_idx = last_completed_idx
 
-    try:
-        with open(TEMP_TOKENS_BIN, "wb") as f_out:
-            for shard_path in shards_to_process:
-                idx = extract_shard_index(shard_path)
-                print(f"Downloading and extracting: {shard_path} (Index: {idx})...", flush=True)
-                
-                # Download parquet shard locally
-                local_parquet = hf_hub_download(
-                    repo_id=HF_INPUT_REPO,
-                    filename=shard_path,
-                    repo_type="dataset",
-                    token=HF_TOKEN
-                )
-                
-                # Load parquet table and extract token_ids column
-                table = pq.read_table(local_parquet, columns=["token_ids"])
-                
-                # The tokenized database is already stored in a flat format, so we can convert it
-                # directly to a NumPy array in a single fast call.
-                tokens_np = table["token_ids"].to_numpy(zero_copy_only=False)
-                
-                # Append raw uint16 bytes directly to combined file
-                f_out.write(tokens_np.tobytes())
-                
-                # Track the highest index successfully compiled
-                max_completed_idx = max(max_completed_idx, idx)
+    while current_idx < len(shards_to_process):
+        batch = shards_to_process[current_idx : current_idx + batch_size]
+        current_idx += batch_size
 
-        # 4. Compile comat.cpp if binary is missing
-        binary_name = "./comat" if not sys.platform.startswith("win") else "comat.exe"
-        if not os.path.exists(binary_name):
-            print(f"Compiling comat.cpp...", flush=True)
-            cmd = ["g++", "-O3", "-march=native", "-o", binary_name, "comat.cpp"]
-            subprocess.run(cmd, check=True)
-            print("Compilation successful.", flush=True)
+        print(f"\n--- Processing batch: {batch} ---", flush=True)
 
-        # 5. Run the C++ co-occurrence counter directly on the combined binary file
-        print(f"Starting C++ counting on {TEMP_TOKENS_BIN}...", flush=True)
-        if os.path.exists(TEMP_COUNTS_BIN):
-            os.remove(TEMP_COUNTS_BIN)
+        if os.path.exists(TEMP_TOKENS_BIN):
+            os.remove(TEMP_TOKENS_BIN)
 
-        # Run C++ process (which displays the C++ native progress bar on stderr)
-        subprocess.run([binary_name, TEMP_TOKENS_BIN, TEMP_COUNTS_BIN, str(WINDOW_SIZE)], check=True)
-        print("C++ counting completed successfully.", flush=True)
+        downloaded_parquet_files = []
+        try:
+            with open(TEMP_TOKENS_BIN, "wb") as f_out:
+                for shard_path in batch:
+                    idx = extract_shard_index(shard_path)
+                    print(f"Downloading and extracting: {shard_path} (Index: {idx})...", flush=True)
 
-        # 6. Upload final co-occurrence binary file
+                    local_parquet = hf_hub_download(
+                        repo_id=HF_INPUT_REPO,
+                        filename=shard_path,
+                        repo_type="dataset",
+                        token=HF_TOKEN
+                    )
+                    downloaded_parquet_files.append(local_parquet)
+
+                    table = pq.read_table(local_parquet, columns=["token_ids"])
+                    tokens_np = table["token_ids"].to_numpy(zero_copy_only=False)
+                    f_out.write(tokens_np.tobytes())
+                    max_completed_idx = max(max_completed_idx, idx)
+
+            if os.path.exists(TEMP_COUNTS_BIN):
+                os.remove(TEMP_COUNTS_BIN)
+
+            print(f"Starting C++ counting on batch tokens...", flush=True)
+            subprocess.run([binary_name, TEMP_TOKENS_BIN, TEMP_COUNTS_BIN, str(WINDOW_SIZE)], check=True)
+            print("C++ counting completed successfully.", flush=True)
+
+            # Merge iteration counts into accumulated counts
+            new_accumulated = "accumulated_counts_new.bin"
+            if os.path.exists(new_accumulated):
+                os.remove(new_accumulated)
+
+            print(f"Merging iteration counts into accumulated counts...", flush=True)
+            subprocess.run([binary_name, "--merge", accumulated_file, TEMP_COUNTS_BIN, new_accumulated], check=True)
+
+            if os.path.exists(accumulated_file):
+                os.remove(accumulated_file)
+            os.rename(new_accumulated, accumulated_file)
+
+        finally:
+            # Cleanup temporary files
+            for temp_file in [TEMP_TOKENS_BIN, TEMP_COUNTS_BIN]:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            # Cleanup downloaded parquet files
+            for pq_file in downloaded_parquet_files:
+                if os.path.exists(pq_file):
+                    try:
+                        os.remove(pq_file)
+                    except Exception as e:
+                        print(f"Warning: Failed to delete local parquet file {pq_file}: {e}", flush=True)
+
+    # 3. Upload the final co-occurrence binary file at the very end
+    if os.path.exists(accumulated_file):
         dest_filename = f"counts_{WORKER_ID}_s{max_completed_idx}.bin"
-        print(f"Uploading output file {TEMP_COUNTS_BIN} as {dest_filename}...", flush=True)
+        print(f"Uploading final output file {accumulated_file} as {dest_filename}...", flush=True)
         api.upload_file(
-            path_or_fileobj=TEMP_COUNTS_BIN,
+            path_or_fileobj=accumulated_file,
             path_in_repo=dest_filename,
             repo_id=HF_OUTPUT_REPO,
             repo_type="dataset",
             token=HF_TOKEN
         )
         print(f"Upload successful. Completed up to shard index: {max_completed_idx}", flush=True)
-
-    finally:
-        # Clean up temporary files to release disk space
-        for temp_file in [TEMP_TOKENS_BIN, TEMP_COUNTS_BIN]:
-            if os.path.exists(temp_file):
-                print(f"Cleaning up local file: {temp_file}", flush=True)
-                os.remove(temp_file)
-        print("Cleanup done.", flush=True)
+        os.remove(accumulated_file)
+    else:
+        print("Error: accumulated counts file not found at the end of the run.", file=sys.stderr, flush=True)
 
 if __name__ == "__main__":
     run_pipeline()
