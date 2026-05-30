@@ -73,36 +73,7 @@ def save_metadata(api: HfApi, last_idx: int) -> None:
         if os.path.exists(local_path):
             os.remove(local_path)
 
-def trigger_next_run() -> None:
-    """
-    Trigger workflow dispatch for the current worker's GitHub repository.
-    """
-    github_pat = os.getenv("GITHUB_PAT")
-    if not github_pat:
-        print("Warning: GITHUB_PAT env variable is not set. Cannot chain trigger next run.", flush=True)
-        return
-
-    repo_name = f"embeddings_worker_{WORKER_ID}"
-    url = f"https://api.github.com/repos/{GITHUB_ORG}/{repo_name}/actions/workflows/main.yml/dispatches"
-    data = json.dumps({"ref": "main"}).encode("utf-8")
-    
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Authorization": f"token {github_pat}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "embeddings-chain-trigger",
-            "Content-Type": "application/json"
-        },
-        method="POST"
-    )
-    print(f"Triggering next execution for repository {GITHUB_ORG}/{repo_name}...", flush=True)
-    try:
-        with urllib.request.urlopen(req) as response:
-            print("Successfully triggered next run via workflow_dispatch.", flush=True)
-    except Exception as e:
-        print(f"Error triggering next run: {e}", flush=True)
+# Chain triggering is disabled.
 
 def get_input_shards_list(api: HfApi) -> List[str]:
     """
@@ -164,8 +135,8 @@ def run_pipeline() -> None:
         subprocess.run(cmd, check=True)
         print("Compilation successful.", flush=True)
 
-    # Capped at 10 shards per runner run (to prevent timeout)
-    SHARDS_LIMIT_THIS_RUN = 10
+    # Capped at 4 shards per runner run
+    SHARDS_LIMIT_THIS_RUN = 4
     batch_size = MAX_SHARDS_PER_RUN
     
     # We only process up to SHARDS_LIMIT_THIS_RUN
@@ -198,7 +169,9 @@ def run_pipeline() -> None:
                         repo_id=HF_INPUT_REPO,
                         filename=shard_path,
                         repo_type="dataset",
-                        token=HF_TOKEN
+                        token=HF_TOKEN,
+                        local_dir=".",
+                        local_dir_use_symlinks=False
                     )
                     downloaded_parquet_files.append(local_parquet)
 
@@ -243,12 +216,11 @@ def run_pipeline() -> None:
                     except Exception as e:
                         print(f"Warning: Failed to delete local parquet file {pq_file}: {e}", flush=True)
 
-    # 5. Chain triggering: If there are still shards left, dispatch the next runner run
+    # Check if there are still shards remaining in total queue
     remaining_shards = shards_to_process[len(run_shards):]
     if remaining_shards:
         print(f"Workflow completed processing {len(run_shards)} shards.", flush=True)
         print(f"{len(remaining_shards)} shards remaining in total queue.", flush=True)
-        trigger_next_run()
     else:
         print("All remaining shards have been successfully processed!", flush=True)
 
