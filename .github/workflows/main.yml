@@ -1,11 +1,6 @@
 name: Build Semantic Neighbors
 
 on:
-  push:
-    paths:
-      - 'pipline.py'
-      - 'comat.cpp'
-      - '.github/workflows/main.yml'
   workflow_dispatch:
 
 jobs:
